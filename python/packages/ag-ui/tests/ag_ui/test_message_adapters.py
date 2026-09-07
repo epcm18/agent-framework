@@ -12,6 +12,7 @@ from agent_framework import Content, Message
 
 from agent_framework_ag_ui._message_adapters import (
     agent_framework_messages_to_agui,
+    agent_framework_messages_to_agui_host_history,
     agui_messages_to_agent_framework,
     agui_messages_to_snapshot_format,
     extract_text_from_contents,
@@ -53,6 +54,116 @@ def test_agent_framework_to_agui_basic(sample_agent_framework_message):
     assert messages[0]["role"] == "user"
     assert messages[0]["content"] == "Hello"
     assert messages[0]["id"] == "msg-123"
+
+
+def test_agent_framework_to_agui_preserves_mcp_host_payload_after_reload():
+    """Host history uses persisted MCP data without changing generic model output."""
+    host_payload = {
+        "content": [{"type": "text", "text": "Summary"}],
+        "structuredContent": {"image_url": "https://example.test/widget.png"},
+        "isError": False,
+    }
+    tool_return = Content.from_text(
+        "Summary",
+        additional_properties={_MCP_TOOL_RESULT_HOST_PAYLOAD_KEY: host_payload},
+    )
+    message = Message(
+        role="tool",
+        contents=[Content.from_function_result(call_id="mcp-1", result=[tool_return])],
+        message_id="message-1",
+    )
+    restored_message = Message.from_dict(message.to_dict())
+
+    outbound = agent_framework_messages_to_agui([restored_message])
+    converted = agent_framework_messages_to_agui_host_history([restored_message])
+
+    assert restored_message.contents[0].result == "Summary"
+    assert outbound[0]["content"] == "Summary"
+    assert _AGUI_MCP_TOOL_RESULT_KEY not in outbound[0]
+    assert _AGUI_TOOL_RESULT_MODEL_CONTENT_KEY not in outbound[0]
+    assert json.loads(converted[0]["content"]) == host_payload
+    assert converted[0]["toolCallId"] == "mcp-1"
+
+    provider_messages = agui_messages_to_agent_framework(converted)
+    assert provider_messages[0].contents[0].result == "Summary"
+
+
+def test_host_history_conversion_preserves_parallel_results_and_mixed_content():
+    """Host conversion keeps upstream parallel-result splitting and mixed content."""
+    host_payload = {
+        "content": [{"type": "text", "text": "Host summary"}],
+        "structuredContent": {"widget": "parallel"},
+        "isError": False,
+    }
+    mcp_result = Content.from_text(
+        "Model summary",
+        additional_properties={_MCP_TOOL_RESULT_HOST_PAYLOAD_KEY: host_payload},
+    )
+    message = Message(
+        role="assistant",
+        contents=[
+            Content.from_function_result(call_id="mcp-call", result=[mcp_result]),
+            Content.from_function_result(call_id="plain-call", result="Plain result"),
+            Content.from_text("Both tools completed."),
+        ],
+        message_id="parallel-result",
+    )
+
+    generic = agent_framework_messages_to_agui([message])
+    host_history = agent_framework_messages_to_agui_host_history([message])
+
+    assert [item["role"] for item in generic] == ["tool", "tool", "assistant"]
+    assert [item["toolCallId"] for item in generic[:2]] == ["mcp-call", "plain-call"]
+    assert [item["content"] for item in generic] == ["Model summary", "Plain result", "Both tools completed."]
+    assert all(_AGUI_MCP_TOOL_RESULT_KEY not in item for item in generic)
+
+    assert [item["role"] for item in host_history] == ["tool", "tool", "assistant"]
+    assert [item["toolCallId"] for item in host_history[:2]] == ["mcp-call", "plain-call"]
+    assert json.loads(host_history[0]["content"]) == host_payload
+    assert host_history[0][_AGUI_MCP_TOOL_RESULT_KEY] is True
+    assert host_history[1]["content"] == "Plain result"
+    assert host_history[2]["content"] == "Both tools completed."
+    assert len({item["id"] for item in host_history}) == 3
+
+
+def test_host_history_conversion_is_public_and_bounds_aggregate_payloads():
+    """The public converter keeps newest Host data within the shared aggregate budget."""
+    from agent_framework.ag_ui import agent_framework_messages_to_agui_host_history as namespace_converter
+
+    from agent_framework_ag_ui import agent_framework_messages_to_agui_host_history as package_converter
+
+    messages: list[Message] = []
+    for index in range(2):
+        model_text = f"Summary {index}"
+        host_payload = {
+            "content": [{"type": "text", "text": model_text}],
+            "structuredContent": {"widget_data": "x" * 64, "index": index},
+            "isError": False,
+        }
+        item = Content.from_text(
+            model_text,
+            additional_properties={_MCP_TOOL_RESULT_HOST_PAYLOAD_KEY: host_payload},
+        )
+        messages.append(
+            Message(
+                role="tool",
+                contents=[Content.from_function_result(call_id=f"mcp-{index}", result=[item])],
+            )
+        )
+
+    unbounded = package_converter(messages, max_host_payload_history_size_bytes=10_000)
+    newest_size = len(unbounded[1]["content"].encode("utf-8")) + len(
+        json.dumps(unbounded[1][_AGUI_TOOL_RESULT_MODEL_CONTENT_KEY], separators=(",", ":")).encode("utf-8")
+    )
+    converted = package_converter(messages, max_host_payload_history_size_bytes=newest_size)
+
+    assert namespace_converter is package_converter
+    assert converted[0]["content"] == "Summary 0"
+    assert converted[0]["_agentFrameworkHostPayloadOmitted"] is True
+    assert _AGUI_MCP_TOOL_RESULT_KEY not in converted[0]
+    assert _AGUI_TOOL_RESULT_MODEL_CONTENT_KEY not in converted[0]
+    assert json.loads(converted[1]["content"])["structuredContent"]["index"] == 1
+    assert converted[1][_AGUI_MCP_TOOL_RESULT_KEY] is True
 
 
 def test_marked_mcp_snapshot_restores_lossless_model_items():
