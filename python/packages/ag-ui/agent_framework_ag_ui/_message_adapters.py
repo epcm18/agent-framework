@@ -16,8 +16,11 @@ from agent_framework import (
 )
 
 from ._utils import (
+    _AGUI_MCP_TOOL_RESULT_KEY,
+    _AGUI_TOOL_RESULT_MODEL_CONTENT_KEY,
     AGUI_TO_FRAMEWORK_ROLE,
     FRAMEWORK_TO_AGUI_ROLE,
+    _model_content_from_mcp_host_payload,
     get_role_value,
     normalize_agui_role,
     safe_json_parse,
@@ -718,6 +721,32 @@ def agui_messages_to_agent_framework(messages: list[dict[str, Any]]) -> list[Mes
                     parsed = cast(dict[str, Any], parsed_candidate)
             elif isinstance(result_content, dict):
                 parsed = cast(dict[str, Any], result_content)
+
+            if msg.get(_AGUI_MCP_TOOL_RESULT_KEY) is True:
+                serialized_items = msg.get(_AGUI_TOOL_RESULT_MODEL_CONTENT_KEY)
+                model_items: list[Content] | None = None
+                if (
+                    isinstance(serialized_items, list)
+                    and serialized_items
+                    and all(
+                        isinstance(item, dict) and item.get("type") in {"text", "data", "uri", "error"}
+                        for item in serialized_items
+                    )
+                ):
+                    try:
+                        model_items = [Content.from_dict(item) for item in serialized_items]
+                    except (TypeError, ValueError):
+                        model_items = None
+                if not model_items:
+                    model_items = [Content.from_text(_model_content_from_mcp_host_payload(parsed))]
+                chat_msg = Message(
+                    role="tool",
+                    contents=[Content.from_function_result(call_id=str(tool_call_id), result=model_items)],
+                )
+                if "id" in msg:
+                    chat_msg.message_id = msg["id"]
+                result.append(chat_msg)
+                continue
 
             is_approval = parsed is not None and "accepted" in parsed
 
